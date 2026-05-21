@@ -1,0 +1,184 @@
+// This is the iap-kit Prisma schema.
+// iap-kit owns only IAP tables. Consuming apps bring their own User/Product
+// tables and reference them here by string ID (no FK constraints).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum ProductType {
+  ONE_TIME
+  SUBSCRIPTION
+}
+
+enum StorePlatform {
+  IOS
+  ANDROID
+}
+
+enum StoreEnvironment {
+  SANDBOX
+  PRODUCTION
+}
+
+enum TransactionStatus {
+  PENDING
+  VERIFIED
+  GRANTED
+  REVOKED
+  FAILED
+}
+
+enum EntitlementStatus {
+  ACTIVE
+  REVOKED
+}
+
+enum RefundStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  FAILED
+  DEAD
+}
+
+enum RefundResolution {
+  REVOKED
+  RESTORED
+  NO_CHANGE
+}
+
+// ─── Models ──────────────────────────────────────────────────────────────────
+
+/// Core ledger record. One row per purchase or subscription renewal.
+model IapTransaction {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// External ref — the consuming app's user ID (no FK constraint)
+  userId      String
+  /// External ref — the consuming app's product or plan ID (no FK constraint)
+  productId   String
+  productType ProductType
+  platform    StorePlatform
+  environment StoreEnvironment
+  status      TransactionStatus @default(PENDING)
+
+  /// The store SKU that was purchased (Apple product ID / Google SKU)
+  storeSku              String
+  /// Apple transactionId or Google orderId — unique per transaction
+  transactionId         String            @unique
+  /// Apple only — links all renewals of the same subscription back to the original purchase
+  originalTransactionId String?
+
+  purchasedAt DateTime
+  /// Subscriptions only — when the current period expires
+  expiresAt   DateTime?
+  /// Subscriptions only
+  autoRenewing Boolean?
+
+  /// Full decoded Apple/Google API response stored for auditability
+  rawPayload Json
+
+  events      IapEvent[]
+  entitlement IapEntitlement?
+
+  @@map("iap_transactions")
+}
+
+/// Maps the consuming app's productId to an Apple/Google store SKU.
+/// The bridge between iap-kit and the store catalog.
+model IapStoreProduct {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// External ref — the consuming app's product ID
+  productId   String
+  platform    StorePlatform
+  /// Apple product ID or Google SKU
+  storeSku    String
+  productType ProductType
+  active      Boolean @default(true)
+
+  /// One SKU per product per platform
+  @@unique([productId, platform])
+  @@map("iap_store_products")
+}
+
+/// Current access state for a userId + productId pair.
+/// Upserted on grant, updated on revoke or subscription renewal.
+model IapEntitlement {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// External ref — the consuming app's user ID
+  userId      String
+  /// External ref — the consuming app's product or plan ID
+  productId   String
+  productType ProductType
+  status      EntitlementStatus @default(ACTIVE)
+
+  grantedAt DateTime
+  /// Subscriptions only — mirrors IapTransaction.expiresAt for the active period
+  expiresAt DateTime?
+  revokedAt DateTime?
+
+  transactionId Int            @unique
+  transaction   IapTransaction @relation(fields: [transactionId], references: [id])
+
+  /// One entitlement per user + product (upserted, not duplicated)
+  @@unique([userId, productId])
+  @@map("iap_entitlements")
+}
+
+/// Raw Apple/Google webhook payloads with processing lifecycle.
+/// Append-only on receipt; status updated as the refund is processed.
+model IapRefundNotification {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  platform    StorePlatform
+  environment StoreEnvironment
+
+  /// The Apple transactionId or Google orderId referenced by this notification
+  storeTransactionId String
+
+  /// Full signed/decoded notification payload
+  rawPayload  Json
+  status      RefundStatus     @default(PENDING)
+  resolution  RefundResolution?
+
+  retryCount  Int       @default(0)
+  processedAt DateTime?
+
+  @@map("iap_refund_notifications")
+}
+
+/// Append-only audit log of every step through the IAP verification flow.
+model IapEvent {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now())
+
+  transactionId Int
+  transaction   IapTransaction @relation(fields: [transactionId], references: [id])
+
+  /// Flow stage: VERIFY | RESOLVE | GRANT | REVOKE | REFUND
+  stage  String
+  /// Outcome: SUCCESS | FAILED
+  status String
+
+  /// Optional structured metadata (error details, resolved product info, etc.)
+  meta Json?
+
+  @@map("iap_events")
+}
